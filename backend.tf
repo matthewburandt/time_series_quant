@@ -5,7 +5,7 @@
 
 terraform {
   backend "gcs" {
-    bucket = "time-series-quant-tfstate" # replace with your actual bucket
+    bucket = "time-series-quant-tfstate"
     prefix = "gdp-forecast"
   }
 }
