@@ -1,0 +1,132 @@
+id: gdp_forecast_ingestion
+namespace: gdp_forecast
+description: |
+  Pull real GDP (GDPC1) from FRED API, stage in GCS, load into BigQuery.
+  Schedule: quarterly after BEA release (~end of Jan, Apr, Jul, Oct).
+  Can also be triggered manually.
+
+labels:
+  project: gdp-forecast
+  layer: ingestion
+
+inputs:
+  - id: fred_series_id
+    type: STRING
+    defaults: "GDPC1"
+    description: "FRED series ID — GDPC1 is Real GDP (billions of chained 2017 dollars)"
+
+variables:
+  gcp_project: "YOUR_PROJECT_ID"
+  gcs_bucket: "gdp-forecast-raw-YOUR_PROJECT_ID"
+  bq_dataset: "gdp_forecast_dev"
+  bq_table: "raw_real_gdp"
+
+triggers:
+  # Quarterly schedule — runs on the 1st of Feb, May, Aug, Nov
+  # (gives a few days buffer after typical BEA advance estimate release)
+  - id: quarterly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 1 2,5,8,11 *"
+
+tasks:
+  # ------------------------------------------------------------------
+  # 1. Fetch GDP data from FRED API
+  # ------------------------------------------------------------------
+  - id: fetch_gdp_from_fred
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.12-slim
+    beforeCommands:
+      - pip install requests pandas
+    env:
+      FRED_API_KEY: "{{ secret('FRED_API_KEY') }}"
+    script: |
+      import requests
+      import pandas as pd
+      from datetime import datetime, timezone
+
+      fred_api_key = "{{ envs.FRED_API_KEY }}"
+      series_id = "{{ inputs.fred_series_id }}"
+
+      # Pull full series from FRED
+      url = "https://api.stlouisfed.org/fred/series/observations"
+      params = {
+          "series_id": series_id,
+          "api_key": fred_api_key,
+          "file_type": "json",
+          "sort_order": "asc"
+      }
+
+      response = requests.get(url, params=params)
+      response.raise_for_status()
+      observations = response.json()["observations"]
+
+      # Build DataFrame
+      rows = []
+      for obs in observations:
+          if obs["value"] != ".":  # FRED uses "." for missing values
+              rows.append({
+                  "observation_date": obs["date"],
+                  "real_gdp": float(obs["value"]),
+                  "ingested_at": datetime.now(timezone.utc).isoformat(),
+                  "source_file": ""  # populated after GCS upload
+              })
+
+      df = pd.DataFrame(rows)
+      print(f"Fetched {len(df)} observations from FRED series {series_id}")
+      print(f"Date range: {df['observation_date'].min()} to {df['observation_date'].max()}")
+
+      # Write to CSV for downstream tasks
+      output_path = "gdp_raw.csv"
+      df.to_csv(output_path, index=False)
+
+    outputFiles:
+      - "gdp_raw.csv"
+
+  # ------------------------------------------------------------------
+  # 2. Upload raw CSV to GCS
+  # ------------------------------------------------------------------
+  - id: upload_to_gcs
+    type: io.kestra.plugin.gcp.gcs.Upload
+    from: "{{ outputs.fetch_gdp_from_fred.outputFiles['gdp_raw.csv'] }}"
+    to: "gs://{{ vars.gcs_bucket }}/fred/gdpc1/{{ trigger.date ?? now() | date('yyyy-MM-dd_HHmmss') }}/gdp_raw.csv"
+    serviceAccount: "{{ secret('GCP_SERVICE_ACCOUNT_KEY') }}"
+    projectId: "{{ vars.gcp_project }}"
+
+  # ------------------------------------------------------------------
+  # 3. Load from GCS into BigQuery (truncate + reload full series)
+  # ------------------------------------------------------------------
+  - id: load_to_bigquery
+    type: io.kestra.plugin.gcp.bigquery.LoadFromGcs
+    from:
+      - "{{ outputs.upload_to_gcs.uri }}"
+    destinationTable: "{{ vars.gcp_project }}.{{ vars.bq_dataset }}.{{ vars.bq_table }}"
+    format: CSV
+    csvOptions:
+      skipLeadingRows: 1
+    writeDisposition: WRITE_TRUNCATE
+    serviceAccount: "{{ secret('GCP_SERVICE_ACCOUNT_KEY') }}"
+    projectId: "{{ vars.gcp_project }}"
+
+  # ------------------------------------------------------------------
+  # 4. Validate the load
+  # ------------------------------------------------------------------
+  - id: validate_load
+    type: io.kestra.plugin.gcp.bigquery.Query
+    sql: |
+      SELECT
+        COUNT(*) as row_count,
+        MIN(observation_date) as earliest,
+        MAX(observation_date) as latest,
+        ROUND(AVG(real_gdp), 2) as avg_gdp
+      FROM `{{ vars.gcp_project }}.{{ vars.bq_dataset }}.{{ vars.bq_table }}`
+    serviceAccount: "{{ secret('GCP_SERVICE_ACCOUNT_KEY') }}"
+    projectId: "{{ vars.gcp_project }}"
+    fetchOne: true
+
+  - id: log_validation
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Ingestion complete:
+        Rows loaded: {{ outputs.validate_load.row.row_count }}
+        Date range:  {{ outputs.validate_load.row.earliest }} → {{ outputs.validate_load.row.latest }}
+        Avg GDP:     {{ outputs.validate_load.row.avg_gdp }}
