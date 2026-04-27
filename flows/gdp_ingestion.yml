@@ -36,48 +36,38 @@ tasks:
     type: io.kestra.plugin.scripts.python.Script
     containerImage: python:3.12-slim
     beforeCommands:
-      - pip install requests pandas
-    env:
-      FRED_API_KEY: "{{ secret('FRED_API_KEY') }}"
+      - pip install fredapi pandas
     script: |
-      import requests
       import pandas as pd
+      from fredapi import Fred
       from datetime import datetime, timezone
 
-      fred_api_key = "{{ envs.FRED_API_KEY }}"
+      fred_api_key = "{{ secret('FRED_API_KEY') }}"
       series_id = "{{ inputs.fred_series_id }}"
 
-      # Pull full series from FRED
-      url = "https://api.stlouisfed.org/fred/series/observations"
-      params = {
-          "series_id": series_id,
-          "api_key": fred_api_key,
-          "file_type": "json",
-          "sort_order": "asc"
-      }
+      # Fetch GDP data using FRED Python API
+      fred = Fred(api_key=fred_api_key)
+      gdp_data = fred.get_series(series_id)
 
-      response = requests.get(url, params=params)
-      response.raise_for_status()
-      observations = response.json()["observations"]
+      # Convert to DataFrame
+      gdp_df = pd.DataFrame(gdp_data, columns=['real_gdp'])
+      gdp_df.index.name = 'observation_date'
+      gdp_df = gdp_df.reset_index()
 
-      # Build DataFrame
-      rows = []
-      for obs in observations:
-          if obs["value"] != ".":  # FRED uses "." for missing values
-              rows.append({
-                  "observation_date": obs["date"],
-                  "real_gdp": float(obs["value"]),
-                  "ingested_at": datetime.now(timezone.utc).isoformat(),
-                  "source_file": ""  # populated after GCS upload
-              })
+      # Add ingestion metadata
+      gdp_df['observation_date'] = gdp_df['observation_date'].dt.date
+      gdp_df['ingested_at'] = datetime.now(timezone.utc).isoformat()
+      gdp_df['source_file'] = ''  # populated after GCS upload
 
-      df = pd.DataFrame(rows)
-      print(f"Fetched {len(df)} observations from FRED series {series_id}")
-      print(f"Date range: {df['observation_date'].min()} to {df['observation_date'].max()}")
+      # Drop any NaN rows (fredapi returns NaN instead of ".")
+      gdp_df = gdp_df.dropna(subset=['real_gdp'])
+
+      print(f"Fetched {len(gdp_df)} observations from FRED series {series_id}")
+      print(f"Date range: {gdp_df['observation_date'].min()} to {gdp_df['observation_date'].max()}")
 
       # Write to CSV for downstream tasks
       output_path = "gdp_raw.csv"
-      df.to_csv(output_path, index=False)
+      gdp_df.to_csv(output_path, index=False)
 
     outputFiles:
       - "gdp_raw.csv"
